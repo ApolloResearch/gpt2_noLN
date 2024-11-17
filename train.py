@@ -72,6 +72,8 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+# Removing LayerNorm
+remove_layer_norm = False
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -252,6 +254,98 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+
+gap_ln2 = 20
+gap_ln1qk = 20
+gap_ln1v = 30
+gap_lnf = None
+gap_eot = 0
+gap_bos = 0
+
+n_ln2 = 200
+n_ln1qk = n_ln2 + 12 * gap_ln2
+n_ln1v = n_ln1qk + 12 * gap_ln1qk
+n_lnf = n_ln1v + 12 * gap_ln1v
+n_eot = n_lnf + 20
+n_bos = n_eot + 100
+
+
+class LNRemover:
+    def __init__(self, start_step, layer_gap_steps, function):
+        self.n_layers = 12
+        self.start_step = start_step
+        self.layer_gap_steps = layer_gap_steps
+        self.function = function
+    def __call__(self, step):
+        if self.layer_gap_steps is None:
+            # LN functions without layer (i.e. ln_f)
+            if step == self.start_step:
+                self.function()
+        elif self.layer_gap_steps == 0:
+            # LNs where we disable all layers at once
+            if step == self.start_step:
+                [self.function(i) for i in range(self.n_layers)]
+        elif (step - self.start_step) % self.layer_gap_steps == 0:
+            # LNs where we disable one layer at a time
+            layer_index = (step - self.start_step) // self.layer_gap_steps
+            if 0 <= layer_index < self.n_layers:
+                self.function(layer_index)
+        else:
+            # Not at a step where we need to disable a LN
+            pass
+    def log(self, wandb):
+        name = self.function.__name__
+        wandb.log({
+            f'{name}.start_step': self.start_step,
+            f'{name}.layer_gap_steps': self.layer_gap_steps,
+        })
+
+ln_removers = [
+    LNRemover(n_ln2, gap_ln2, model.disable_ln_2),
+    LNRemover(n_ln1qk, gap_ln1qk, model.disable_ln_1qk),
+    LNRemover(n_ln1v, gap_ln1v, model.disable_ln_1v),
+    LNRemover(n_lnf, gap_lnf, model.disable_ln_f),
+    LNRemover(n_eot, gap_eot, model.disable_eot_std),
+    LNRemover(n_bos, gap_bos, model.disable_bos_std),
+]
+
+if wandb_log:
+    for remover in ln_removers:
+        remover.log(wandb)
+    wandb.log(
+        {
+            'effective_batch_size': batch_size * gradient_accumulation_steps,
+            'batch_size': batch_size,
+            'gradient_accumulation_steps': gradient_accumulation_steps,
+        }
+    )
+
+# Get the exact same data samples when resuming from a checkpoint by re-running the code
+# that draws samples.
+if init_from == 'resume':
+    print("Resuming training from a checkpoint")
+    def dummy_get_batch(split, batch_size):
+        if split == 'train':
+            data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        else:
+            data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        torch.randint(len(data) - block_size, (batch_size,))
+    def dummy_estimate_loss():
+        for split in ['train', 'val']:
+            for k in range(eval_iters):
+                dummy_get_batch(split, batch_size)
+    for iter_dummy in range(iter_num):
+        if remove_layer_norm:
+            for remover in ln_removers:
+                remover(iter_dummy)
+        if iter_dummy % eval_interval == 0 and iter_dummy > 0 and master_process:
+            dummy_estimate_loss()
+        for micro_step in range(gradient_accumulation_steps):
+            dummy_get_batch('train', batch_size)
+    # Need to run 1 extra call to estimate_loss() after the last iter.
+    dummy_estimate_loss()
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -259,8 +353,12 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+    if remove_layer_norm:
+        for remover in ln_removers:
+            remover(iter_num)
+
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0 and local_iter_num > 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -289,6 +387,7 @@ while True:
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+    losses = [] # for logging
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -298,6 +397,7 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
+            losses.append(loss.item())
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -320,7 +420,12 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
+        # I changed this collect a list of losses and take the mean over all
+        # micro steps because I care about more accurate loss curves. This may
+        # slow down training though.
+        lossf = np.mean(losses)
+        if wandb_log:
+            wandb.log({'iter': iter_num, 'current_loss': lossf})
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
