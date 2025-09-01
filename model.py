@@ -171,7 +171,7 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config, layer_number=layer_number) for layer_number in range(config.n_layer)]),
-            ln_f = FakeLayerNorm(config.n_embd, layer='blocks.11.hook_resid_post', bias=config.bias),
+            ln_f = FakeLayerNorm(config.n_embd, layer=f'blocks.{config.n_layer - 1}.hook_resid_post', bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -398,33 +398,33 @@ class GPT(nn.Module):
         self.transformer.h[block_index].ln_1.average_std[0] = self.transformer.h[block_index].ln_1.average_std[1]
         self.transformer.h[block_index].ln_1.bos_std[0] = self.transformer.h[block_index].ln_1.bos_std[1]
         self.transformer.h[block_index].ln_2.average_std[0] = self.transformer.h[block_index].ln_2.average_std[1]
-        if block_index == 11:
+        if block_index == self.config.n_layer - 1:
             self.transformer.ln_f.average_std[0] = self.transformer.ln_f.average_std[1]
             self.print_ln_removal_verification()
         print(f"disabled bos std for block {block_index}")
 
     def print_ln_removal_verification(self):
-        for block_index in range(12):
+        for block_index in range(self.config.n_layer):
             print(f"Block: {block_index}")
-            print(f"------------")
+            print("------------")
             pos0 = self.transformer.h[block_index].ln_1.average_std[0]
             pos1 = self.transformer.h[block_index].ln_1.average_std[1]
             print(f"LN_1 pos 0: {pos0}, LN1 pos 1 {pos1}")
             print(f"LN_1 all equal to pos 0: {(self.transformer.h[block_index].ln_1.average_std == pos0).all()}")
-            print(f"--")
+            print("--")
             pos0 = self.transformer.h[block_index].ln_1.bos_std[0]
             pos1 = self.transformer.h[block_index].ln_1.bos_std[1]
             print(f"LN_1 BOS pos 0: {pos0}, LN1 BOS pos 1 {pos1}")
             print(f"LN_1 BOS all equal to pos 0: {(self.transformer.h[block_index].ln_1.bos_std == pos0).all()}")
-            print(f"--")
+            print("--")
             pos0 = self.transformer.h[block_index].ln_2.average_std[0]
             pos1 = self.transformer.h[block_index].ln_2.average_std[1]
             print(f"LN_2 pos 0: {pos0}, LN2 pos 1 {pos1}")
             print(f"LN_2 all equal to pos 0: {(self.transformer.h[block_index].ln_2.average_std == pos0).all()}")
-            print(f"--")
+            print("--")
         pos0 = self.transformer.ln_f.average_std[0]
         pos1 = self.transformer.ln_f.average_std[1]
         print(f"LN_F pos 0: {pos0}, LNF pos 1 {pos1}")
         print(f"LN_F all equal to pos 0: {(self.transformer.ln_f.average_std == pos0).all()}")
-        print(f"------------")
+        print("------------")
         
